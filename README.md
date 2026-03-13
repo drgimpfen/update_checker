@@ -6,7 +6,8 @@ A lean and reliable Python script for automated monitoring of system updates on 
 
 * **Detailed Update Reports:** Generates a structured summary of pending and recently installed packages.
 * **Automatic Activity Summary:** Parses logs from the last 24 hours to show exactly what `unattended-upgrades` installed overnight.
-* **Reboot Monitoring:** * Detects if a reboot was triggered by system logs.
+* **Reboot Monitoring:**
+    * Detects if a reboot was triggered by system logs.
     * Verifies the actual system uptime to confirm if a restart was successful.
 * **Security Focused:** Identifies and highlights critical `[SECURITY]` updates.
 * **Direct SMTP:** Sends reports directly via an external SMTP server (e.g., Mailjet). No local mail server (Postfix/Exim) required.
