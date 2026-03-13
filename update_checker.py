@@ -2,7 +2,9 @@
 
 import subprocess
 import smtplib
+import datetime
 import os
+import re
 from email.mime.text import MIMEText
 
 # --- SMTP Configuration ---
@@ -14,101 +16,142 @@ SENDER_EMAIL = 'sender@your-domain.com'
 RECEIVER_EMAIL = 'recipient@email.com'
 
 # --- Configuration ---
-# Set to None or "" to disable the tag
-SUBJECT_TAG = "[Server Tag]" 
+LOG_FILE = '/var/log/unattended-upgrades/unattended-upgrades.log'
+# Optional tag for the subject line; set to None or "" to disable
+SUBJECT_TAG = "[SERVER-TAG]"
 
-def check_reboot_required():
-    """Checks if the system flag for a required reboot exists."""
-    return os.path.exists('/var/run/reboot-required')
-
-def get_upgradable_info():
-    """
-    Simulates a dist-upgrade to see ALL available packages,
-    including those that would normally be 'kept back'.
-    """
+def get_uptime():
+    """Returns human-readable uptime and a boolean if rebooted within 24h."""
     try:
-        # Update package lists
+        with open('/proc/uptime', 'r') as f:
+            uptime_seconds = float(f.readline().split()[0])
+            uptime_string = str(datetime.timedelta(seconds=int(uptime_seconds)))
+            recently_rebooted = uptime_seconds < 86400
+            return uptime_string, recently_rebooted
+    except Exception:
+        return "Unknown", False
+
+def get_unattended_log_data(hours=24):
+    """Parses the unattended-upgrades log for activity in the last X hours."""
+    if not os.path.exists(LOG_FILE):
+        return [], False
+    
+    now = datetime.datetime.now()
+    installed = []
+    reboot_signal = False
+    
+    try:
+        with open(LOG_FILE, 'r') as f:
+            for line in f:
+                match = re.match(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', line)
+                if match:
+                    log_date = datetime.datetime.strptime(match.group(1), '%Y-%m-%d %H:%M:%S')
+                    if (now - log_date).total_seconds() < (hours * 3600):
+                        if "Packages that were upgraded:" in line:
+                            pkgs = line.split(":")[-1].strip()
+                            if pkgs: installed.extend(pkgs.split())
+                        if "rebooting" in line.lower() or "reboot-required" in line.lower():
+                            reboot_signal = True
+    except Exception:
+        pass
+    return list(set(installed)), reboot_signal
+
+def get_pending_updates():
+    """Simulates a dist-upgrade to find all currently available updates."""
+    try:
         subprocess.run(['sudo', 'apt', 'update'], check=True, capture_output=True)
-        
-        # Simulate dist-upgrade to catch every single available update
         result = subprocess.run(['apt-get', '-s', 'dist-upgrade'], check=True, capture_output=True, text=True)
         
         upgrades = []
         security_count = 0
-        
         for line in result.stdout.split('\n'):
-            # Look for lines starting with 'Inst ' (Installation/Update)
             if line.startswith('Inst '):
-                parts = line.split(' ')
-                package_name = parts[1]
-                
-                # Identify security updates by checking the repository source in the string
+                package_name = line.split(' ')[1]
                 if 'security' in line.lower():
                     upgrades.append(f"{package_name} [SECURITY]")
                     security_count += 1
                 else:
                     upgrades.append(package_name)
-        
-        # Sort the list so that [SECURITY] updates appear at the top
         upgrades.sort(key=lambda x: "[SECURITY]" not in x)
-        
         return upgrades, security_count
-    except Exception as e:
-        print(f"Error during update check: {e}")
+    except Exception:
         return [], 0
 
+def check_reboot_required_flag():
+    """Checks if the system currently has a reboot-required flag set."""
+    return os.path.exists('/var/run/reboot-required')
+
 def send_email(subject, body):
-    """Sends the formatted email via the configured SMTP server."""
+    """Sends the formatted report via SMTP."""
     try:
         msg = MIMEText(body)
         msg['Subject'] = subject
         msg['From'] = SENDER_EMAIL
         msg['To'] = RECEIVER_EMAIL
-        
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
             server.starttls()
             server.login(SMTP_USER, SMTP_PASS)
             server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
         return True
-    except Exception as e:
-        print(f"Failed to send email: {e}")
+    except Exception:
         return False
 
 if __name__ == "__main__":
-    # Get the system's hostname
     hostname = subprocess.check_output(['hostname']).decode('utf-8').strip()
     
-    # Gather update and reboot information
-    upgrades, security_count = get_upgradable_info()
-    reboot_needed = check_reboot_required()
+    # 1. Check what happened (Logs & Uptime)
+    uptime_str, was_rebooted = get_uptime()
+    auto_installed, log_reboot_signal = get_unattended_log_data(24)
     
-    # Only send email if there are updates available or a reboot is pending
-    if upgrades or reboot_needed:
-        # Construct the subject line with an optional tag
-        base_subject = f"System Status: {hostname}"
-        if SUBJECT_TAG and SUBJECT_TAG.strip():
-            full_subject = f"{SUBJECT_TAG.strip()} {base_subject}"
-        else:
-            full_subject = base_subject
+    # 2. Check what is still pending
+    pending_upgrades, pending_security = get_pending_updates()
+    reboot_flag_present = check_reboot_required_flag()
 
-        body = f"System Status Report for: {hostname}\n"
-        body += "=" * 40 + "\n\n"
-        
-        reboot_status = "REQUIRED" if reboot_needed else "No restart required"
-        body += f"REBOOT STATUS: {reboot_status}\n\n"
-            
-        body += f"Summary:\n"
-        body += f"- Total packages available: {len(upgrades)}\n"
-        body += f"- Security updates identified: {security_count}\n\n"
-        
-        body += "Package Details:\n"
-        body += "-" * 40 + "\n"
-        if upgrades:
-            body += "\n".join(upgrades)
-        else:
-            body += "No packages pending."
-        body += "\n" + "-" * 40 + "\n"
-        
-        send_email(full_subject, body)
+    # 3. Construct Report
+    subject = f"{SUBJECT_TAG + ' ' if SUBJECT_TAG else ''}System Update Status Report: {hostname}"
+    
+    body = f"DAILY SYSTEM UPDATE STATUS REPORT: {hostname}\n"
+    body += "=" * 60 + "\n"
+    body += f"Report Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+    body += "=" * 60 + "\n\n"
+
+    # --- SECTION 1: REBOOT & UPTIME ---
+    body += "1. SYSTEM REBOOT & UPTIME STATUS\n"
+    body += "-" * 40 + "\n"
+    body += f"Uptime: {uptime_str}\n"
+    if was_rebooted:
+        body += "Result: SUCCESS - System was restarted within the last 24h.\n"
+    elif log_reboot_signal:
+        body += "Result: WARNING - Reboot was triggered by logs but uptime is > 24h!\n"
     else:
-        print("System is up to date. No email sent.")
+        body += "Result: System running continuously.\n"
+    
+    if reboot_flag_present:
+        body += "Flag:   [!] REBOOT REQUIRED to finish current updates.\n"
+    body += "\n"
+
+    # --- SECTION 2: AUTOMATIC UPDATES (LAST 24H) ---
+    body += "2. UNATTENDED UPGRADES (Last 24h)\n"
+    body += "-" * 40 + "\n"
+    if auto_installed:
+        body += "The following packages were installed automatically:\n"
+        body += "\n".join(f"- {p}" for p in auto_installed)
+    else:
+        body += "No automatic installations were performed."
+    body += "\n\n"
+
+    # --- SECTION 3: PENDING UPDATES (ACTION REQUIRED) ---
+    body += "3. PENDING UPDATES (Action required)\n"
+    body += "-" * 40 + "\n"
+    body += f"Total pending: {len(pending_upgrades)}\n"
+    body += f"Security:      {pending_security}\n\n"
+    if pending_upgrades:
+        body += "Details:\n"
+        body += "\n".join(f"- {p}" for p in pending_upgrades)
+    else:
+        body += "Your system is up to date. Well done!"
+    body += "\n\n" + "=" * 60 + "\n"
+
+    # Send only if there is something to report
+    if auto_installed or pending_upgrades or was_rebooted or reboot_flag_present:
+        send_email(subject, body)
