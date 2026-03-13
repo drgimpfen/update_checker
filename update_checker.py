@@ -2,41 +2,59 @@
 
 import subprocess
 import smtplib
+import os
 from email.mime.text import MIMEText
 
-# SMTP Configuration
-SMTP_SERVER = 'in-v3.mailjet.com'
+# --- SMTP Configuration ---
+SMTP_SERVER = 'mail.server.com'
 SMTP_PORT = 587
 SMTP_USER = 'YOUR_API_KEY'
 SMTP_PASS = 'YOUR_API_SECRET'
 SENDER_EMAIL = 'sender@your-domain.com'
 RECEIVER_EMAIL = 'recipient@email.com'
 
-# Configure subject tag
+# --- Configuration ---
 SUBJECT_TAG = "[SERVER-ALERT]" 
 
-def get_upgradable_packages():
-    """Executes apt update and apt list --upgradable and returns the package list."""
-    print("Starting manual update check...")
+def check_reboot_required():
+    """Checks if the system flag for a required reboot exists."""
+    return os.path.exists('/var/run/reboot-required')
+
+def get_upgradable_info():
+    """
+    Performs an apt update and simulates an upgrade to identify 
+    security updates vs. regular updates.
+    """
     try:
-        # First, update the package lists to get current information
+        # Update package lists
         subprocess.run(['sudo', 'apt', 'update'], check=True, capture_output=True)
-        # List all upgradable packages
-        result = subprocess.run(['apt', 'list', '--upgradable'], check=True, capture_output=True, text=True)
-        lines = result.stdout.strip().split('\n')
         
-        # Filter out the "Listing..." line and other unnecessary output
-        package_list = [line for line in lines if not line.startswith('Listing...') and not line.startswith('Done')]
+        # Simulate upgrade
+        result = subprocess.run(['apt-get', '-s', 'upgrade'], check=True, capture_output=True, text=True)
         
-        if len(package_list) > 0:
-            return package_list
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        upgrades = []
+        security_count = 0
+        
+        for line in result.stdout.split('\n'):
+            if line.startswith('Inst '):
+                parts = line.split(' ')
+                package_name = parts[1]
+                
+                # Check for security repositories in the simulation line
+                # "trixie-security" is specific to Debian 13 testing/stable
+                if 'security' in line.lower() or 'trixie-security' in line.lower():
+                    upgrades.append(f"{package_name} [SECURITY]")
+                    security_count += 1
+                else:
+                    upgrades.append(f"{package_name}")
+        
+        return upgrades, security_count
+    except Exception as e:
         print(f"Error during update check: {e}")
-    return []
+        return [], 0
 
 def send_email(subject, body):
-    """Sends an email via the configured SMTP server."""
-    print(f"Attempting to send email to {RECEIVER_EMAIL}...")
+    """Sends the formatted email via SMTP."""
     try:
         msg = MIMEText(body)
         msg['Subject'] = subject
@@ -50,21 +68,39 @@ def send_email(subject, body):
         print("Email sent successfully.")
         return True
     except Exception as e:
-        print(f"Error sending email: {e}")
+        print(f"Failed to send email: {e}")
         return False
 
 if __name__ == "__main__":
-    upgradable_packages = get_upgradable_packages()
-    if upgradable_packages:
-        hostname = subprocess.check_output(['hostname']).decode('utf-8').strip()
+    # Get system information
+    hostname = subprocess.check_output(['hostname']).decode('utf-8').strip()
+    upgrades, security_count = get_upgradable_info()
+    reboot_needed = check_reboot_required()
+    
+    # Send email only if updates are available or a reboot is pending
+    if upgrades or reboot_needed:
+        subject = f"{SUBJECT_TAG} System Status Report: {hostname}"
         
-        # Create the subject with the configurable tag
-        subject = f"{SUBJECT_TAG} Updates available on {hostname}"
+        body = f"System Status Report for: {hostname}\n"
+        body += "=" * 40 + "\n\n"
         
-        # Create the formatted email message
-        body = f"There are {len(upgradable_packages)} updates available:\n\n"
-        body += "\n".join(upgradable_packages)
+        if reboot_needed:
+            body += "REBOOT STATUS: A restart is REQUIRED to apply changes.\n\n"
+        else:
+            body += "REBOOT STATUS: No restart required.\n\n"
+            
+        body += f"Summary:\n"
+        body += f"- Total packages to upgrade: {len(upgrades)}\n"
+        body += f"- Security updates identified: {security_count}\n\n"
+        
+        body += "Package Details:\n"
+        body += "-" * 40 + "\n"
+        if upgrades:
+            body += "\n".join(upgrades)
+        else:
+            body += "No packages pending."
+        body += "\n" + "-" * 40 + "\n"
         
         send_email(subject, body)
     else:
-        print("No updates found or an error occurred.")
+        print("System is up to date. No email sent.")
