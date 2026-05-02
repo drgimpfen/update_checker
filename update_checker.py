@@ -7,7 +7,7 @@ import os
 import re
 from email.mime.text import MIMEText
 
-# SMTP-Configuration
+# SMTP Configuration
 SMTP_SERVER = 'mail.server.com'
 SMTP_PORT = 587
 SMTP_USER = 'user'
@@ -15,7 +15,7 @@ SMTP_PASS = 'password'
 SENDER_EMAIL = 'email@server.com'
 RECEIVER_EMAIL = 'your@mail.com'
 
-# optional subject tag
+# Optional tag for the subject line; set to None or "" to disable
 SUBJECT_TAG = "[Subject Tag]"
 
 # Log File
