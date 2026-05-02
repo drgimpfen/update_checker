@@ -7,18 +7,22 @@ import os
 import re
 from email.mime.text import MIMEText
 
-# --- SMTP Configuration ---
+# SMTP-Configuration
 SMTP_SERVER = 'mail.server.com'
 SMTP_PORT = 587
-SMTP_USER = 'YOUR_API_KEY'
-SMTP_PASS = 'YOUR_API_SECRET'
-SENDER_EMAIL = 'sender@your-domain.com'
-RECEIVER_EMAIL = 'recipient@email.com'
+SMTP_USER = 'user'
+SMTP_PASS = 'password'
+SENDER_EMAIL = 'email@server.com'
+RECEIVER_EMAIL = 'your@mail.com'
 
-# --- Configuration ---
+# optional subject tag
+SUBJECT_TAG = "[Subject Tag]"
+
+# Log File
 LOG_FILE = '/var/log/unattended-upgrades/unattended-upgrades.log'
-# Optional tag for the subject line; set to None or "" to disable
-SUBJECT_TAG = "[SERVER-TAG]"
+
+# Hours to look back in the log file
+LOG_CHECK_HOURS = 24
 
 def get_uptime():
     """Returns human-readable uptime and a boolean if rebooted within 24h."""
@@ -35,45 +39,52 @@ def get_unattended_log_data(hours=24):
     """Parses the unattended-upgrades log for activity in the last X hours."""
     if not os.path.exists(LOG_FILE):
         return [], False
-    
+
     now = datetime.datetime.now()
     installed = []
     reboot_signal = False
-    
+    current_log_date = None
+
+    # Phrases used by unattended-upgrades to list packages
+    target_phrases = ["Packages that were upgraded:", "Packages that will be upgraded:"]
+
     try:
         with open(LOG_FILE, 'r') as f:
             for line in f:
-                match = re.match(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', line)
+                # Recognize timestamp at start of line
+                match = re.search(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', line)
                 if match:
-                    log_date = datetime.datetime.strptime(match.group(1), '%Y-%m-%d %H:%M:%S')
-                    if (now - log_date).total_seconds() < (hours * 3600):
-                        if "Packages that were upgraded:" in line:
-                            pkgs = line.split(":")[-1].strip()
-                            if pkgs: installed.extend(pkgs.split())
-                        if "rebooting" in line.lower() or "reboot-required" in line.lower():
-                            reboot_signal = True
+                    try:
+                        current_log_date = datetime.datetime.strptime(match.group(1), '%Y-%m-%d %H:%M:%S')
+                    except ValueError:
+                        continue
+
+                # Process if line belongs to a timestamp within the timeframe
+                if current_log_date and (now - current_log_date).total_seconds() < (hours * 3600):
+                    if any(phrase in line for phrase in target_phrases):
+                        pkgs = line.split(":")[-1].strip()
+                        if pkgs:
+                            installed.extend([p for p in pkgs.split() if p])
+
+                    if "rebooting" in line.lower() or "reboot-required" in line.lower():
+                        reboot_signal = True
     except Exception:
         pass
-    return list(set(installed)), reboot_signal
+
+    return sorted(list(set(installed))), reboot_signal
 
 def get_pending_updates():
-    """Simulates a dist-upgrade to find all currently available updates."""
+    """Parses 'apt list --upgradable' to find available updates based on local cache."""
     try:
-        subprocess.run(['sudo', 'apt', 'update'], check=True, capture_output=True)
-        result = subprocess.run(['apt-get', '-s', 'dist-upgrade'], check=True, capture_output=True, text=True)
-        
+        result = subprocess.run(['apt', 'list', '--upgradable'], check=True, capture_output=True, text=True)
+
         upgrades = []
-        security_count = 0
         for line in result.stdout.split('\n'):
-            if line.startswith('Inst '):
-                package_name = line.split(' ')[1]
-                if 'security' in line.lower():
-                    upgrades.append(f"{package_name} [SECURITY]")
-                    security_count += 1
-                else:
-                    upgrades.append(package_name)
-        upgrades.sort(key=lambda x: "[SECURITY]" not in x)
-        return upgrades, security_count
+            if '/' in line and 'upgradable from' in line:
+                package_name = line.split('/')[0]
+                upgrades.append(package_name)
+
+        return sorted(upgrades), 0
     except Exception:
         return [], 0
 
@@ -98,18 +109,18 @@ def send_email(subject, body):
 
 if __name__ == "__main__":
     hostname = subprocess.check_output(['hostname']).decode('utf-8').strip()
-    
-    # 1. Check what happened (Logs & Uptime)
+
+    # 1. Check activity (Logs & Uptime)
     uptime_str, was_rebooted = get_uptime()
-    auto_installed, log_reboot_signal = get_unattended_log_data(24)
-    
-    # 2. Check what is still pending
+    auto_installed, log_reboot_signal = get_unattended_log_data(LOG_CHECK_HOURS)
+
+    # 2. Check pending status
     pending_upgrades, pending_security = get_pending_updates()
     reboot_flag_present = check_reboot_required_flag()
 
     # 3. Construct Report
     subject = f"{SUBJECT_TAG + ' ' if SUBJECT_TAG else ''}System Update Status Report: {hostname}"
-    
+
     body = f"DAILY SYSTEM UPDATE STATUS REPORT: {hostname}\n"
     body += "=" * 60 + "\n"
     body += f"Report Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
@@ -125,13 +136,13 @@ if __name__ == "__main__":
         body += "Result: WARNING - Reboot was triggered by logs but uptime is > 24h!\n"
     else:
         body += "Result: System running continuously.\n"
-    
+
     if reboot_flag_present:
         body += "Flag:   [!] REBOOT REQUIRED to finish current updates.\n"
     body += "\n"
 
-    # --- SECTION 2: AUTOMATIC UPDATES (LAST 24H) ---
-    body += "2. UNATTENDED UPGRADES (Last 24h)\n"
+    # --- SECTION 2: AUTOMATIC UPDATES ---
+    body += f"2. UNATTENDED UPGRADES (Last {LOG_CHECK_HOURS}h)\n"
     body += "-" * 40 + "\n"
     if auto_installed:
         body += "The following packages were installed automatically:\n"
@@ -152,6 +163,6 @@ if __name__ == "__main__":
         body += "Your system is up to date. Well done!"
     body += "\n\n" + "=" * 60 + "\n"
 
-    # Send only if there is something to report
+    # Send only if there is activity or pending action
     if auto_installed or pending_upgrades or was_rebooted or reboot_flag_present:
         send_email(subject, body)
